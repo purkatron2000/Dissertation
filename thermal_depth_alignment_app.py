@@ -17,6 +17,7 @@ the hardware and dataset are stable.
 import argparse
 import builtins
 import collections
+import json
 import os
 import threading
 import time
@@ -113,10 +114,14 @@ FACE_MIN_SIZE = 60
 DNN_CONFIDENCE_THRESHOLD = 0.6  # reject low-confidence DNN detections
 
 # Alignment and correction heuristics
+ALIGNMENT_FILE = os.path.expanduser("~/Desktop/thermal_rgb_alignment.json")
 THERMAL_SCALE_X = 1.0
 THERMAL_SCALE_Y = 1.0
 THERMAL_OFFSET_X = 0.0
 THERMAL_OFFSET_Y = 0.0
+ALIGNMENT_NUDGE_PX = 1.0
+ALIGNMENT_SCALE_STEP = 0.02
+ALIGNMENT_HOTSPOT_RADIUS = 6
 THERMAL_PERCENTILE = 85
 REFERENCE_DISTANCE_CM = 100.0
 REFERENCE_AMBIENT_C = 21.0
@@ -264,6 +269,37 @@ def transform_main_camera_frame(frame):
     if MAIN_CAMERA_FLIP_HORIZONTAL:
         frame = cv2.flip(frame, 1)
     return frame
+
+
+def default_alignment():
+    return {
+        "scale_x": THERMAL_SCALE_X,
+        "scale_y": THERMAL_SCALE_Y,
+        "offset_x": THERMAL_OFFSET_X,
+        "offset_y": THERMAL_OFFSET_Y,
+    }
+
+
+def load_alignment(path=ALIGNMENT_FILE):
+    alignment = default_alignment()
+    try:
+        with open(path, "r") as fh:
+            saved = json.load(fh)
+        for key in alignment:
+            if key in saved:
+                alignment[key] = float(saved[key])
+        return alignment, None
+    except IOError:
+        return alignment, "no saved alignment"
+    except Exception as exc:
+        return alignment, "alignment load failed: {}".format(exc)
+
+
+def save_alignment(alignment, path=ALIGNMENT_FILE):
+    payload = dict(alignment)
+    payload["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
 
 
 def get_camera():
@@ -670,14 +706,48 @@ def detect_heads(frame_bgr, detector):
     return detect_heads_haar(frame_bgr, detector["frontal"], detector["profile"])
 
 
-def map_rgb_point_to_thermal(x, y, rgb_w, rgb_h, thermal_w, thermal_h):
+def map_rgb_point_to_thermal(x, y, rgb_w, rgb_h, thermal_w, thermal_h,
+                             alignment=None):
+    alignment = alignment or default_alignment()
     nx = float(x) / max(1.0, float(rgb_w))
     ny = float(y) / max(1.0, float(rgb_h))
-    tx = nx * thermal_w * THERMAL_SCALE_X + THERMAL_OFFSET_X
-    ty = ny * thermal_h * THERMAL_SCALE_Y + THERMAL_OFFSET_Y
+    tx = nx * thermal_w * alignment["scale_x"] + alignment["offset_x"]
+    ty = ny * thermal_h * alignment["scale_y"] + alignment["offset_y"]
     tx = int(max(0, min(thermal_w - 1, round(tx))))
     ty = int(max(0, min(thermal_h - 1, round(ty))))
     return tx, ty
+
+
+def find_hottest_thermal_point(thermal_pixels, around=None, radius=None):
+    if around is not None and radius is not None:
+        cx, cy = around
+        x0 = max(0, int(cx - radius))
+        x1 = min(thermal_pixels.shape[1], int(cx + radius + 1))
+        y0 = max(0, int(cy - radius))
+        y1 = min(thermal_pixels.shape[0], int(cy + radius + 1))
+        roi = thermal_pixels[y0:y1, x0:x1]
+        if roi.size:
+            ry, rx = np.unravel_index(int(np.argmax(roi)), roi.shape)
+            return int(x0 + rx), int(y0 + ry)
+    y, x = np.unravel_index(int(np.argmax(thermal_pixels)), thermal_pixels.shape)
+    return int(x), int(y)
+
+
+def snap_alignment_to_thermal_point(alignment, rgb_point, thermal_point,
+                                    rgb_w, rgb_h, thermal_w, thermal_h):
+    mapped = map_rgb_point_to_thermal(
+        rgb_point[0], rgb_point[1], rgb_w, rgb_h, thermal_w, thermal_h,
+        alignment=alignment)
+    alignment["offset_x"] += float(thermal_point[0] - mapped[0])
+    alignment["offset_y"] += float(thermal_point[1] - mapped[1])
+    return mapped
+
+
+def clamp_alignment(alignment):
+    alignment["scale_x"] = max(0.2, min(2.5, float(alignment["scale_x"])))
+    alignment["scale_y"] = max(0.2, min(2.5, float(alignment["scale_y"])))
+    alignment["offset_x"] = max(-64.0, min(64.0, float(alignment["offset_x"])))
+    alignment["offset_y"] = max(-48.0, min(48.0, float(alignment["offset_y"])))
 
 
 def get_forehead_point(landmarks, face_rect):
@@ -699,7 +769,7 @@ def get_forehead_point(landmarks, face_rect):
 
 
 def extract_face_proxy(thermal_pixels, thermal_point, face_rect, rgb_shape,
-                       landmarks=None):
+                       landmarks=None, alignment=None):
     rgb_h, rgb_w = rgb_shape[:2]
     face_x, face_y, face_w, face_h = face_rect
     thermal_h, thermal_w = thermal_pixels.shape[:2]
@@ -712,7 +782,8 @@ def extract_face_proxy(thermal_pixels, thermal_point, face_rect, rgb_shape,
 
     if target_rgb is not None:
         tx, ty = map_rgb_point_to_thermal(
-            target_rgb[0], target_rgb[1], rgb_w, rgb_h, thermal_w, thermal_h)
+            target_rgb[0], target_rgb[1], rgb_w, rgb_h, thermal_w, thermal_h,
+            alignment=alignment)
     else:
         tx, ty = thermal_point
 
@@ -786,12 +857,17 @@ def draw_crosshair(frame, center, color=(255, 255, 255)):
     cv2.line(frame, (x, y - 12), (x, y + 12), color, 1, cv2.LINE_AA)
 
 
-def add_thermal_inset(frame, thermal, thermal_point=None, thermal_roi=None):
+def add_thermal_inset(frame, thermal, thermal_point=None, thermal_roi=None,
+                      hotspot_point=None):
     pixels = thermal["pixels"]
     norm = cv2.normalize(pixels, None, 0, 255, cv2.NORM_MINMAX)
     heat = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_INFERNO)
     if thermal_point is not None:
         cv2.circle(heat, thermal_point, 1, (255, 255, 255), -1)
+    if hotspot_point is not None:
+        cv2.drawMarker(
+            heat, hotspot_point, (0, 255, 255), cv2.MARKER_CROSS,
+            markerSize=5, thickness=1)
     if thermal_roi is not None:
         x0, y0, x1, y1 = thermal_roi
         cv2.rectangle(heat, (x0, y0), (x1 - 1, y1 - 1), (255, 255, 255), 1)
@@ -836,6 +912,11 @@ def draw_sidebar(sidebar, info):
     _sidebar_text(sidebar, row, "Vertical: {:.1f} deg".format(info.get("pan_angle", 0)))
     row += 1
     _sidebar_text(sidebar, row, "Detector: {}".format(info.get("detector_backend", "?")))
+    row += 1
+    if info.get("calibration_mode"):
+        _sidebar_text(sidebar, row, "Alignment: CALIBRATING", (0, 255, 255))
+    else:
+        _sidebar_text(sidebar, row, "Alignment: active")
     row += 1
 
     # --- Detection section ---
@@ -939,11 +1020,37 @@ def draw_sidebar(sidebar, info):
     _sidebar_text(sidebar, row, "Detect:  {:.1f} FPS".format(info.get("detect_fps", 0)), (0, 255, 255))
     row += 1
 
+    # Alignment calibration
+    row += 1
+    alignment = info.get("alignment")
+    if alignment is not None:
+        _sidebar_heading(sidebar, row, "ALIGNMENT")
+        row += 1
+        _sidebar_text(sidebar, row, "sx:{:.2f} sy:{:.2f}".format(
+            alignment["scale_x"], alignment["scale_y"]))
+        row += 1
+        _sidebar_text(sidebar, row, "ox:{:+.1f} oy:{:+.1f}".format(
+            alignment["offset_x"], alignment["offset_y"]))
+        row += 1
+        msg = info.get("alignment_message")
+        if msg:
+            _sidebar_text(sidebar, row, msg[:34], (0, 255, 255))
+            row += 1
+
     # Keys help
     row += 1
-    _sidebar_text(sidebar, row, "t:track  space:center", (140, 140, 140))
-    row += 1
-    _sidebar_text(sidebar, row, "arrows:manual  q:quit", (140, 140, 140))
+    if info.get("calibration_mode"):
+        _sidebar_text(sidebar, row, "i/k/j/l:nudge  g:hotspot", (140, 140, 140))
+        row += 1
+        _sidebar_text(sidebar, row, "x/X,y/Y:scale  s:save", (140, 140, 140))
+        row += 1
+        _sidebar_text(sidebar, row, "r:reset  c:done  q:quit", (140, 140, 140))
+    else:
+        _sidebar_text(sidebar, row, "t:track  c:calibrate", (140, 140, 140))
+        row += 1
+        _sidebar_text(sidebar, row, "space:center  arrows:manual", (140, 140, 140))
+        row += 1
+        _sidebar_text(sidebar, row, "q:quit", (140, 140, 140))
 
 
 def choose_tracking_step(error_px, deadband_px):
@@ -967,6 +1074,7 @@ def choose_tracking_step(error_px, deadband_px):
 
 def run_once():
     detector, detector_errors = load_detector()
+    alignment, alignment_error = load_alignment()
 
     result = {
         "detector": detector["backend"],
@@ -975,6 +1083,8 @@ def run_once():
         "distance_cm": None,
         "thermal": None,
         "ambient": None,
+        "alignment": alignment,
+        "alignment_status": alignment_error or "loaded",
     }
 
     cap = get_camera()
@@ -1054,6 +1164,8 @@ def run_once():
 
 def run_ui():
     detector, detector_errors = load_detector()
+    alignment, alignment_error = load_alignment()
+    alignment_message = alignment_error or "alignment loaded"
 
     state = SharedState()
     thermal_thread = threading.Thread(target=thermal_worker, args=(state,), daemon=True)
@@ -1085,6 +1197,9 @@ def run_ui():
     pan_last_move_time = time.time()
     prev_face_center = None  # for detection jump filtering
     auto_track = True
+    calibration_mode = False
+    calibration_rgb_point = None
+    calibration_hotspot = None
 
     # FPS tracking
     fps_time = time.time()
@@ -1131,6 +1246,8 @@ def run_ui():
             correction = None
             thermal_point = None
             thermal_roi = None
+            calibration_rgb_point = None
+            calibration_hotspot = None
 
             if best_detection is not None:
                 x, y, w, h = best_detection["rect"]
@@ -1153,17 +1270,23 @@ def run_ui():
 
                 face_center = (x + w // 2, y + h // 2)
                 cv2.circle(frame, face_center, 4, (80, 255, 80), -1)
+                calibration_rgb_point = face_center
 
                 if thermal is not None:
                     thermal_point = map_rgb_point_to_thermal(
                         face_center[0], face_center[1],
                         rgb_w, rgb_h,
                         thermal["pixels"].shape[1], thermal["pixels"].shape[0],
+                        alignment=alignment,
                     )
+                    calibration_hotspot = find_hottest_thermal_point(
+                        thermal["pixels"], around=thermal_point,
+                        radius=ALIGNMENT_HOTSPOT_RADIUS)
                     proxy = extract_face_proxy(
                         thermal["pixels"], thermal_point,
                         best_detection["rect"], frame.shape,
                         landmarks=landmarks,
+                        alignment=alignment,
                     )
                     if proxy is not None:
                         thermal_roi = proxy["roi_bounds"]
@@ -1212,7 +1335,11 @@ def run_ui():
 
             # Thermal inset stays on the camera frame.
             if thermal is not None:
-                add_thermal_inset(frame, thermal, thermal_point=thermal_point, thermal_roi=thermal_roi)
+                add_thermal_inset(
+                    frame, thermal,
+                    thermal_point=thermal_point,
+                    thermal_roi=thermal_roi,
+                    hotspot_point=calibration_hotspot if calibration_mode else None)
 
             # FPS counter
             fps_count += 1
@@ -1245,6 +1372,9 @@ def run_ui():
                 "detector_errors": detector_errors,
                 "display_fps": fps_display,
                 "detect_fps": detect_fps,
+                "alignment": alignment,
+                "alignment_message": alignment_message,
+                "calibration_mode": calibration_mode,
             })
 
             # Composite: camera frame + sidebar.
@@ -1253,8 +1383,64 @@ def run_ui():
             key = cv2.waitKeyEx(1)
             if key in (27, ord("q")):
                 break
-            if key == ord("t"):
+            if key == ord("c"):
+                calibration_mode = not calibration_mode
+                auto_track = False if calibration_mode else auto_track
+                alignment_message = "calibration on" if calibration_mode else "calibration off"
+            elif key == ord("t"):
                 auto_track = not auto_track
+            elif calibration_mode and key == ord("g"):
+                if thermal is not None and calibration_rgb_point is not None:
+                    hot = find_hottest_thermal_point(thermal["pixels"])
+                    before = snap_alignment_to_thermal_point(
+                        alignment, calibration_rgb_point, hot,
+                        rgb_w, rgb_h,
+                        thermal["pixels"].shape[1], thermal["pixels"].shape[0])
+                    clamp_alignment(alignment)
+                    alignment_message = "snapped {} -> {}".format(before, hot)
+                else:
+                    alignment_message = "need face + thermal"
+            elif calibration_mode and key == ord("s"):
+                try:
+                    save_alignment(alignment)
+                    alignment_message = "saved alignment"
+                except Exception as exc:
+                    alignment_message = "save failed: {}".format(exc)
+            elif calibration_mode and key == ord("r"):
+                alignment = default_alignment()
+                alignment_message = "reset alignment"
+            elif calibration_mode and key == ord("j"):
+                alignment["offset_x"] -= ALIGNMENT_NUDGE_PX
+                clamp_alignment(alignment)
+                alignment_message = "offset x -"
+            elif calibration_mode and key == ord("l"):
+                alignment["offset_x"] += ALIGNMENT_NUDGE_PX
+                clamp_alignment(alignment)
+                alignment_message = "offset x +"
+            elif calibration_mode and key == ord("i"):
+                alignment["offset_y"] -= ALIGNMENT_NUDGE_PX
+                clamp_alignment(alignment)
+                alignment_message = "offset y -"
+            elif calibration_mode and key == ord("k"):
+                alignment["offset_y"] += ALIGNMENT_NUDGE_PX
+                clamp_alignment(alignment)
+                alignment_message = "offset y +"
+            elif calibration_mode and key == ord("x"):
+                alignment["scale_x"] -= ALIGNMENT_SCALE_STEP
+                clamp_alignment(alignment)
+                alignment_message = "scale x -"
+            elif calibration_mode and key == ord("X"):
+                alignment["scale_x"] += ALIGNMENT_SCALE_STEP
+                clamp_alignment(alignment)
+                alignment_message = "scale x +"
+            elif calibration_mode and key == ord("y"):
+                alignment["scale_y"] -= ALIGNMENT_SCALE_STEP
+                clamp_alignment(alignment)
+                alignment_message = "scale y -"
+            elif calibration_mode and key == ord("Y"):
+                alignment["scale_y"] += ALIGNMENT_SCALE_STEP
+                clamp_alignment(alignment)
+                alignment_message = "scale y +"
             elif key == 32:
                 pan_angle = DEFAULT_PAN_ANGLE
                 tilt_angle = DEFAULT_TILT_ANGLE

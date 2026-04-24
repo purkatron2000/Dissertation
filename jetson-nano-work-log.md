@@ -1611,3 +1611,68 @@ The Nano was given internet access through the Mac for package installation:
 - Mac IP forwarding was already enabled (`net.inet.ip.forwarding=1`)
 - Mac NAT/PF was already configured
 - Confirmed working: ping to `8.8.8.8` and `google.com` both succeed from the Nano
+
+## GitHub Versioning and Thermal-RGB Alignment Work — April 24, 2026
+
+The local dissertation folder was not previously a Git repository. Before
+continuing the thermal/RGB alignment implementation, the folder was initialised
+as a Git repository and connected to:
+
+- `https://github.com/purkatron2000/Dissertation.git`
+
+Initial baseline pushed to `main`:
+
+- commit `e64c089`
+- message: `Initial Jetson prototype baseline`
+- included files:
+  - `.gitignore`
+  - `Depth-alignment-for-thermal-cameras.txt`
+  - `jetson-nano-work-log.md`
+  - `thermal_depth_alignment_app.py`
+
+The baseline was intentionally created from the pre-alignment version of
+`thermal_depth_alignment_app.py` so the thermal/RGB alignment work can be
+reviewed separately.
+
+Feature branch created:
+
+- `codex/thermal-rgb-alignment`
+
+Thermal/RGB alignment implementation started on the feature branch:
+
+- added persistent alignment settings stored at:
+  - `~/Desktop/thermal_rgb_alignment.json`
+- added alignment parameters:
+  - `scale_x`
+  - `scale_y`
+  - `offset_x`
+  - `offset_y`
+- changed `map_rgb_point_to_thermal()` so RGB-to-thermal mapping uses the
+  loaded alignment settings instead of only fixed constants
+- threaded the active alignment through forehead/face thermal ROI extraction
+- added a calibration sidebar section showing current scale and offset values
+- added live calibration mode toggled with `c`
+- added keyboard controls in calibration mode:
+  - `i` / `k` nudge thermal mapping up/down
+  - `j` / `l` nudge thermal mapping left/right
+  - `x` / `X` decrease/increase horizontal scale
+  - `y` / `Y` decrease/increase vertical scale
+  - `g` snap the mapping offset toward the hottest nearby thermal pixel
+  - `s` save the current alignment JSON
+  - `r` reset alignment to defaults
+- added a thermal inset marker for the local hottest thermal point while in
+  calibration mode
+
+Local verification completed:
+
+- `python3 -m py_compile thermal_depth_alignment_app.py` passes
+
+Jetson deployment status:
+
+- deployment and live calibration testing were not completed at this point
+- the direct Ethernet link to the Nano was not up:
+  - `en8` existed on the Mac
+  - `en8` reported `media: autoselect (none)`
+  - `ping -c 2 192.168.1.10` returned 100% packet loss
+- the user may need to reconnect the Ethernet adapter/cable and rerun the
+  Mac-side static networking commands before SSH/SCP deployment can continue
