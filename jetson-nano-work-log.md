@@ -1739,3 +1739,611 @@ Current blocker:
   - verify SDA/SCL wiring to the shared I2C bus
   - check whether the thermal module has become unplugged or loose
   - power-cycle the rig if wiring appears correct
+
+### Separate no-servo alignment calibrator
+
+The user requested that alignment testing be separated from the main app so
+servo movement cannot nudge the fragile thermal-camera connection.
+
+New standalone file created locally and deployed to the Nano:
+
+- local:
+  - `thermal_rgb_alignment_calibrator.py`
+- Nano:
+  - `~/Desktop/thermal_rgb_alignment_calibrator.py`
+
+Purpose:
+
+- test and tune RGB-to-thermal alignment only
+- keep the RGB camera, DNN detector, MLX90640 thermal feed, URM13 distance,
+  BME280 ambient readings, sidebar, and thermal ROI display
+- avoid any pan/tilt servo interaction during alignment tests
+
+Servo safety changes in the calibrator:
+
+- no `HardwarePWMServo(...)` instances are created
+- no PWM export or servo centering occurs
+- auto-tracking is disabled
+- arrow keys and space bar do not move servos
+- `--test-once` reports:
+  - `servo: disabled in alignment calibrator`
+
+Calibration controls in the separate app:
+
+- starts in calibration mode
+- `i` / `k`: nudge thermal mapping up/down
+- `j` / `l`: nudge thermal mapping left/right
+- `x` / `X`: decrease/increase horizontal scale
+- `y` / `Y`: decrease/increase vertical scale
+- `g`: snap mapping offset toward the hottest thermal point
+- `s`: save current alignment to `~/Desktop/thermal_rgb_alignment.json`
+- `r`: reset alignment to defaults
+- `c`: toggle calibration mode
+- `q`: quit
+
+Verification completed:
+
+- local syntax check passed:
+  - `python3 -m py_compile thermal_rgb_alignment_calibrator.py`
+- remote syntax check passed:
+  - `python3 -m py_compile thermal_rgb_alignment_calibrator.py`
+- remote `--test-once` passed with:
+  - `camera: True`
+  - `detector: dnn_ssd`
+  - `detector_errors: ok`
+  - `distance_cm: 248`
+  - BME280 ambient reading working
+  - MLX90640 thermal frame working
+  - `servo: disabled in alignment calibrator`
+
+The no-servo calibrator was launched on the Jetson desktop with:
+
+```bash
+cd ~/Desktop && DISPLAY=:0 python3 thermal_rgb_alignment_calibrator.py
+```
+
+The app is now the active alignment test program. The main integrated app is
+not being run for this test.
+
+### Distance-aware alignment correction
+
+During live use, the user observed that a single fixed thermal/RGB offset is
+not useful because alignment changes with subject distance. This is expected:
+the RGB and thermal cameras are physically separated, so parallax means the
+correct thermal offset varies with depth.
+
+Important design correction:
+
+- the first implemented calibration idea was a simple fixed offset/scale model
+- it let the operator nudge the mapped thermal point until it lined up at one
+  specific standing position
+- this was useful as a quick diagnostic because it proved the overlay could be
+  adjusted live and saved
+- however, it did not solve the actual project problem
+
+Why the basic offset approach failed:
+
+- aligning at one distance only makes the two camera views agree at that
+  particular depth
+- when the user moved closer or farther away, the mapped thermal point drifted
+  away from the real warm face/blob
+- this is not just a tuning mistake; it is caused by parallax between the RGB
+  camera and the MLX90640 thermal camera
+- because the cameras are not in exactly the same physical location, the
+  apparent relative position of the subject changes with distance
+- therefore one global `(offset_x, offset_y)` cannot be correct for all subject
+  distances
+
+Rejected approach:
+
+- continuing to tune one fixed offset would only produce a calibration that
+  works for the exact position where it was tuned
+- that would not be useful for the intended system because a user will not
+  stand at one fixed distance from the rig
+- it would also make later temperature extraction misleading, because the
+  thermal ROI could appear correct during calibration but be wrong during real
+  use at another depth
+
+Revised design reasoning:
+
+- the system already has a URM13 distance sensor
+- instead of treating distance only as an input to temperature correction, it
+  can also be used to select the correct RGB-to-thermal alignment
+- the practical calibration target is therefore not one offset, but a small
+  table of offsets measured at different distances
+- for a distance between two measured points, linear interpolation is a
+  reasonable first approximation
+- for distances outside the measured range, the nearest calibration sample is
+  used until more data is collected
+
+The separate no-servo calibrator was updated again to use distance-aware
+alignment samples rather than one fixed offset.
+
+New calibration model:
+
+- `thermal_rgb_alignment_calibrator.py` now stores:
+  - global `scale_x`
+  - global `scale_y`
+  - default `offset_x`
+  - default `offset_y`
+  - `distance_samples`
+- each distance sample contains:
+  - `distance_cm`
+  - `offset_x`
+  - `offset_y`
+- at runtime, the app uses the live URM13 `distance_cm` reading to interpolate
+  between the two nearest stored samples
+- if the subject is closer than the nearest sample, the nearest close sample is
+  used
+- if the subject is farther than the farthest sample, the nearest far sample is
+  used
+
+Updated workflow:
+
+1. Put the subject/warm target at one distance.
+2. Use `i` / `k` / `j` / `l` to nudge the mapped thermal point onto the real
+   hot region.
+3. Press `a` to add or update a calibration sample at the current URM13
+   distance.
+4. Move the subject/warm target to another distance.
+5. Repeat the nudge and `a` sample process.
+6. Press `s` to save all samples to:
+   - `~/Desktop/thermal_rgb_alignment.json`
+
+Updated controls:
+
+- `i` / `k`: temporary nudge up/down for the current distance
+- `j` / `l`: temporary nudge left/right for the current distance
+- `a`: add/update the current distance sample using the current nudge-adjusted
+  offset
+- `s`: save the full distance sample table
+- `g`: snap the current temporary nudge toward the hottest thermal point
+- `r`: reset the full alignment model
+- `x` / `X`: adjust global horizontal scale
+- `y` / `Y`: adjust global vertical scale
+- `q`: quit
+
+Verification:
+
+- local syntax check passed
+- remote syntax check passed
+- remote `--test-once` passed with:
+  - camera working
+  - DNN SSD detector working
+  - BME280 working
+  - URM13 distance working
+  - MLX90640 thermal frame working
+  - servo disabled
+  - zero initial distance samples
+
+The upgraded distance-aware no-servo calibrator was relaunched on the Jetson
+desktop for testing.
+
+### Saved distance-aware alignment sample set
+
+The user completed a manual calibration pass and pressed `s` to save the
+distance-aware alignment model.
+
+Important status note:
+
+- this records that a distance-aware alignment model was saved
+- it does **not** mean the model has been validated as correct yet
+- the next step is to move the subject to several distances and check whether
+  the mapped thermal marker stays aligned with the real hot region without
+  further manual nudging
+
+Saved file on the Nano:
+
+- `~/Desktop/thermal_rgb_alignment.json`
+
+The saved file was copied back locally as:
+
+- `thermal_rgb_alignment_saved.json`
+
+Saved alignment contents:
+
+```json
+{
+  "distance_samples": [
+    {
+      "distance_cm": 53.0,
+      "offset_x": -3.0,
+      "offset_y": 3.0
+    },
+    {
+      "distance_cm": 78.0,
+      "offset_x": -8.369402985074627,
+      "offset_y": 2.0242537313432836
+    },
+    {
+      "distance_cm": 93.0,
+      "offset_x": -6.791044776119403,
+      "offset_y": -1.7611940298507465
+    },
+    {
+      "distance_cm": 122.0,
+      "offset_x": -2.259701492537314,
+      "offset_y": 0.8746268656716416
+    }
+  ],
+  "offset_x": 0.0,
+  "offset_y": 0.0,
+  "scale_x": 1.0,
+  "scale_y": 1.0,
+  "updated_at": "2026-03-19 17:24:11"
+}
+```
+
+Interpretation:
+
+- although the user took approximately five or six measurements, the saved
+  model contains four samples
+- this is expected because the calibrator merges samples that are within
+  `ALIGNMENT_SAMPLE_MERGE_CM = 8` cm of an existing sample
+- the current saved calibration range is approximately:
+  - close: `53 cm`
+  - middle: `78 cm`
+  - middle/far: `93 cm`
+  - far: `122 cm`
+- for subject distances between those points, the app interpolates offset
+  values linearly
+- for subject distances closer than `53 cm` or farther than `122 cm`, the
+  nearest saved sample is used
+
+Notable result:
+
+- the horizontal offset is not constant across distance:
+  - `-3.0` px at `53 cm`
+  - about `-8.37` px at `78 cm`
+  - about `-6.79` px at `93 cm`
+  - about `-2.26` px at `122 cm`
+- this confirms the earlier observation that one fixed offset is not adequate
+  for this camera rig
+
+Validation status:
+
+- pending live visual test across multiple distances
+- success criteria should be:
+  - at close, middle, and far distances, the mapped thermal marker remains on
+    the warm face/blob without needing a new manual nudge
+  - the sidebar sample count remains stable
+  - the displayed effective offset changes as the URM13 distance changes
+
+### Distance-only model rejected and guided regression calibrator
+
+The user tested the distance-aware offset model and reported that it still
+looked effectively random. The key observation was that distance alone cannot
+account for:
+
+- where the face appears in the RGB image
+- whether the face is near the image boundary
+- the viewing angle between the RGB and thermal cameras
+- the lateral/vertical parallax caused by the two sensors being mounted in
+  different physical positions
+
+This invalidated the distance-only offset table as the final calibration
+approach. It was useful as a diagnostic step, but still too low-dimensional for
+the actual alignment problem.
+
+Revised calibration target:
+
+Instead of modelling only:
+
+```text
+thermal_offset = f(distance)
+```
+
+the calibrator now builds samples for:
+
+```text
+thermal_x, thermal_y = f(rgb_x, rgb_y, distance)
+```
+
+This directly models where the face appears in the RGB frame and how far away
+it is.
+
+Guided data collection design:
+
+- the no-servo calibrator now presents target positions on the RGB image
+- the user moves their face/head to the requested target position
+- the sidebar tells the user which distance to aim for
+- the user presses `a` to capture a sample
+- each sample records:
+  - RGB face centre `rgb_x`, `rgb_y`
+  - RGB frame size
+  - detected thermal hotspot `thermal_x`, `thermal_y`
+  - thermal frame size
+  - URM13 `distance_cm`
+  - requested target position and target distance
+  - timestamp
+
+Planned sample grid:
+
+- distances:
+  - `50 cm`
+  - `80 cm`
+  - `110 cm`
+  - `140 cm`
+- image positions at each distance:
+  - top-left
+  - top-centre
+  - top-right
+  - middle-left
+  - centre
+  - middle-right
+  - bottom-left
+  - bottom-centre
+  - bottom-right
+- total planned captures:
+  - `4 distances x 9 positions = 36 samples`
+
+Fitting model:
+
+- after at least `9` samples, the calibrator fits two least-squares regression
+  models:
+  - one for `thermal_x`
+  - one for `thermal_y`
+- features used:
+  - constant term
+  - normalised `rgb_x`
+  - normalised `rgb_y`
+  - inverse distance `1 / distance_cm`
+  - `rgb_x * (1 / distance_cm)`
+  - `rgb_y * (1 / distance_cm)`
+  - `rgb_x * rgb_y`
+  - `rgb_x^2`
+  - `rgb_y^2`
+- this is still simple enough to explain in the report, but it is much more
+  appropriate than a fixed offset or a distance-only offset
+
+Live model feedback:
+
+- once fitted, the program displays the predicted thermal point
+- it also compares that prediction with the current thermal hotspot and reports
+  live error in thermal pixels
+- saved model file:
+  - `~/Desktop/thermal_rgb_guided_alignment.json`
+
+Updated guided controls:
+
+- `a`: capture current sample and advance to the next target
+- `f`: fit/re-fit the regression model from current samples
+- `s`: save the guided model JSON
+- `n`: skip current target
+- `b`: go back one target
+- `r`: reset guided samples/model
+- `q`: quit
+
+Verification before live use:
+
+- local syntax check passed
+- remote syntax check passed
+- remote `--test-once` passed with:
+  - `camera: True`
+  - `detector: dnn_ssd`
+  - `distance_cm: 52`
+  - BME280 working
+  - MLX90640 thermal frame working
+  - `servo: disabled in alignment calibrator`
+  - no saved guided model yet
+
+The guided no-servo regression calibrator was deployed to:
+
+- `~/Desktop/thermal_rgb_alignment_calibrator.py`
+
+and launched on the Jetson desktop.
+
+### 140 cm guided calibration stage removed
+
+During the guided regression calibration, the user reported that alignment
+looked accurate until the `140 cm` captures were added, after which the fitted
+model became poor again. This indicates that the far-distance samples were
+likely low quality or outside the range where the current setup gives reliable
+thermal/RGB correspondences.
+
+Action taken:
+
+- stopped the running guided calibrator
+- removed `140 cm` from `GUIDED_DISTANCES_CM`
+- current guided distances are now:
+  - `50 cm`
+  - `80 cm`
+  - `110 cm`
+- total planned captures changed from:
+  - `4 distances x 9 positions = 36 samples`
+  - to `3 distances x 9 positions = 27 samples`
+
+Additional safety tools added to the calibrator:
+
+- `u`: undo the last captured sample
+- `w`: disable the worst residual sample after fitting
+- `v`: re-enable all samples
+- the sidebar now reports enabled/total sample count
+- the sidebar now reports the worst sample and its error after fitting
+
+Reasoning:
+
+- a single bad sample can distort the least-squares regression, especially when
+  the dataset is still small
+- excluding the farthest distance for now should make it easier to fit a stable
+  useful model over the main working range
+- outlier controls make future failed captures recoverable without restarting
+  the whole calibration session
+
+Verification:
+
+- local syntax check passed
+- remote syntax check passed after deployment
+- the updated calibrator was relaunched on the Jetson desktop
+
+### Thermal corner hotspot fault during guided alignment
+
+Time: `2026-04-24 15:11:32 BST`
+
+While preparing to redo the guided calibration without the `140 cm` stage, the
+user reported that the MLX90640 thermal image consistently marked the top-right
+corner as the hottest point, even when the physical camera was moved and there
+was no hot object in that part of the room. This made the visible thermal cross
+stick to the corner and made calibration captures unreliable.
+
+Interpretation:
+
+- this looks like a bad/stuck thermal pixel or read artefact rather than a real
+  heat source
+- whole-frame hottest-pixel tracking is therefore not suitable for calibration
+- this does not invalidate the RGB face detection or guided target method, but
+  it means the thermal correspondence must be found near the expected face area
+  instead of using the global maximum
+
+Action taken in the no-servo calibrator:
+
+- ignored the outer thermal image border when searching for hot points
+- stopped using the whole-frame thermal maximum for guided captures
+- added a local thermal search around the expected face position:
+  - before a model is fitted, this uses the rough normalized RGB-to-thermal
+    position
+  - after a model is fitted, this uses the model prediction
+- kept servo movement disabled
+
+Reasoning:
+
+- a fixed corner artefact can dominate the full-frame maximum even when the
+  user's face is correctly visible in the thermal frame
+- restricting the thermal search to the area where the face should project makes
+  the captured correspondence much more likely to represent the user's head
+- this is still a calibration aid, not the final tracking model; once enough
+  clean samples are captured, the regression model should predict thermal/RGB
+  alignment from face position and distance
+
+Current status:
+
+- updated calibrator is running on the Jetson desktop
+- next step is to verify visually that the thermal cross no longer sticks to the
+  top-right corner during guided capture
+
+### Correction to initial guided thermal search
+
+Time: `2026-04-24 15:16:00 BST`
+
+The user pointed out that the guided calibrator was still limiting the thermal
+search to a small area around an uncalibrated rough projection during the first
+round of captures. That was the wrong dependency: the first captures are meant
+to discover the projection, so they cannot be forced to stay near an estimate
+that may already be far off.
+
+Action taken:
+
+- changed the pre-fit calibration behaviour so it searches the full usable
+  thermal frame, excluding only the ignored border
+- added 3x3 thermal smoothing before selecting the warm point, so isolated
+  stuck/bad pixels have less influence
+- kept the local search behaviour only for after a guided model has been fitted
+- redeployed the no-servo calibrator to the Jetson and restarted it on
+  `DISPLAY=:0`
+
+Reasoning:
+
+- before a model exists, the user needs freedom to gather calibration samples
+  wherever the thermal face blob actually appears
+- after a model exists, a local search around the prediction is useful because
+  it prevents unrelated warm regions from stealing the measurement
+- this separates data collection from model validation instead of allowing an
+  untrained estimate to block calibration
+
+Verification:
+
+- local syntax check passed
+- remote syntax check passed
+- updated calibrator launched on the Jetson desktop
+
+### Robust thermal blob selection implemented
+
+Time: `2026-04-24 15:22:21 BST`
+
+The user reported that the thermal cross still behaved inconsistently: the
+display visibly showed hotter face/forehead regions, but the selected cross
+could appear over a colder-looking purple area. This meant the selection path
+was still not trustworthy enough for calibration.
+
+Problems identified:
+
+- a previously saved bad guided model could be loaded on startup and immediately
+  pull the local thermal search back toward a wrong prediction
+- the calibration capture path should not depend on the current model at all
+  while collecting data
+- a single max pixel or a small artefact is not a robust representation of the
+  user's face heat blob
+
+Action taken:
+
+- changed guided calibration so the capture hotspot always comes from a robust
+  full-frame thermal blob search, independent of the loaded/fitted model
+- kept the fitted model prediction only as a comparison point for live error
+  display, not as the source of calibration captures
+- replaced direct hottest-pixel selection with:
+  - finite-value cleanup
+  - 3x3 spatial smoothing
+  - border ignore
+  - high-percentile hot mask
+  - connected-component selection of the strongest warm blob
+  - rejection of tiny isolated blobs during full-frame search
+- hardened the thermal inset display against non-finite thermal values
+- started the Jetson calibrator clean so old bad guided data is not mixed into
+  the next calibration fit
+
+Reasoning:
+
+- calibration data collection must measure what the thermal camera currently
+  sees, not what a partly wrong model expects to see
+- using a connected warm blob better matches the visible thermal face region and
+  is less sensitive to stuck pixels, I2C artefacts, and single-pixel spikes
+- old saved bad models/samples should not silently influence the next
+  calibration attempt
+
+Verification:
+
+- local syntax check passed
+- updated file was deployed to the Jetson
+- remote syntax check passed
+- no-servo calibrator relaunched on the Jetson desktop
+
+### Guided alignment model saved
+
+Time: `2026-04-24 15:37:28 BST`
+
+The user completed the guided calibration run, pressed `f` to fit the model,
+then pressed `s` to save it. The saved model was copied back from the Jetson for
+inspection.
+
+Saved model file:
+
+- Jetson: `~/Desktop/thermal_rgb_guided_alignment.json`
+- Local copy: `thermal_rgb_guided_alignment.json`
+
+Model summary:
+
+- saved timestamp inside JSON: `2026-03-19 18:40:04` from the Jetson clock
+- total samples: `27`
+- enabled samples: `27`
+- sample distribution:
+  - `50 cm`: `9`
+  - `80 cm`: `9`
+  - `110 cm`: `9`
+- fit RMSE: `0.3918` thermal pixels
+- mean error: `0.3400` thermal pixels
+- max error: `0.8875` thermal pixels
+- worst sample:
+  - index: `10`
+  - target: `80 cm`, `x=0.50`, `y=0.25`
+  - measured distance: `77 cm`
+  - error: `0.8875` thermal pixels
+
+Interpretation:
+
+- the saved dataset is complete for the current `3 distances x 9 positions`
+  calibration plan
+- the residual errors are low in thermal-pixel space, which suggests the model
+  fits the captured calibration points well
+- this still needs live validation by moving around the image and checking that
+  the model prediction remains aligned with the measured thermal face/forehead
+  blob

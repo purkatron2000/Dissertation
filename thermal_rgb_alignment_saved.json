@@ -1,0 +1,29 @@
+{
+  "distance_samples": [
+    {
+      "distance_cm": 53.0,
+      "offset_x": -3.0,
+      "offset_y": 3.0
+    },
+    {
+      "distance_cm": 78.0,
+      "offset_x": -8.369402985074627,
+      "offset_y": 2.0242537313432836
+    },
+    {
+      "distance_cm": 93.0,
+      "offset_x": -6.791044776119403,
+      "offset_y": -1.7611940298507465
+    },
+    {
+      "distance_cm": 122.0,
+      "offset_x": -2.259701492537314,
+      "offset_y": 0.8746268656716416
+    }
+  ],
+  "offset_x": 0.0,
+  "offset_y": 0.0,
+  "scale_x": 1.0,
+  "scale_y": 1.0,
+  "updated_at": "2026-03-19 17:24:11"
+}
