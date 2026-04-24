@@ -2494,3 +2494,34 @@ Reasoning:
 Verification:
 
 - local syntax check passed for `thermal_depth_alignment_app.py`
+
+### Post-Easter thermal camera connection reliability note
+
+Time: `2026-04-24 15:49:02 BST`
+
+The user noted that, after returning from the Easter break, the MLX90640 thermal
+camera connection appears noticeably less reliable than it was before the break.
+This is an important hardware/context observation rather than a confirmed
+software regression.
+
+Observed behaviour during the alignment work:
+
+- intermittent thermal camera failures and read issues occurred while the RGB
+  camera, distance sensor, and other parts of the app were otherwise working
+- the thermal camera sometimes needed the physical connection or rig position
+  adjusted before it behaved normally again
+- earlier in the session the user reported messages/behaviour consistent with
+  bad thermal frames, including the sensor repeatedly favouring an apparently
+  false hot region near the top-right of the thermal image
+- the thermal feed could recover after movement/reseating, suggesting a possible
+  physical connection, cable, soldering, I2C contact, or sensor-board stability
+  issue
+
+Impact on development:
+
+- the standalone no-servo calibration program was kept separate partly to avoid
+  servo movement nudging the camera or worsening the intermittent connection
+- robust thermal blob selection and border rejection were added to reduce the
+  effect of bad/stuck thermal readings during calibration
+- future testing should treat MLX90640 connection stability as a hardware risk
+  and verify the thermal feed before collecting calibration data
