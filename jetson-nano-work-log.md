@@ -2457,7 +2457,40 @@ Expected live behaviour in the main app:
 - sidebar should report `Mode: guided RGB+distance` if the saved model loaded
 - white point/ROI in the thermal inset should come from the trained guided
   model, not from the old fixed offset model
-- old offset/scale alignment remains as fallback only if the guided model is
-  absent or invalid
+- if the guided model is absent or invalid, this branch should error rather than
+  falling back to old offset/scale alignment
 - standalone calibration program remains separate and is not required for normal
   main-app operation after the model has been saved
+
+### Main app changed to require guided model only
+
+Time: `2026-04-24 15:45:04 BST`
+
+The user clarified that the main program must not fall back to the old alignment
+options. This is important because a fallback would make testing ambiguous: the
+program could appear to work while actually using the old fixed offset/scale
+path instead of the trained guided model.
+
+Action taken:
+
+- removed runtime fallback from guided prediction to old offset/scale mapping
+- main UI now raises a `RuntimeError` on startup if
+  `~/Desktop/thermal_rgb_guided_alignment.json` is missing or does not contain
+  valid `coeff_x` and `coeff_y`
+- if guided prediction somehow returns `None` during runtime, the app now errors
+  instead of silently mapping through the old alignment path
+- sidebar no longer advertises `c:calibrate` in normal mode
+- pressing `c` no longer enters the old manual calibration mode; it reports that
+  guided-model alignment is required and old calibration is disabled
+- sidebar wording for missing model was changed from offset fallback to guided
+  model missing
+
+Reasoning:
+
+- this branch is specifically for validating the new learned alignment model
+- silently using the old model would invalidate the test
+- failure should be obvious and immediate if the guided model is not available
+
+Verification:
+
+- local syntax check passed for `thermal_depth_alignment_app.py`

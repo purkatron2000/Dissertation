@@ -1145,13 +1145,7 @@ def draw_sidebar(sidebar, info):
             _sidebar_text(sidebar, row, "RMSE: {:.2f}px  n:{}".format(
                 guided.get("rmse_px", 0.0), len(guided.get("samples", []))))
         else:
-            _sidebar_text(sidebar, row, "Mode: offset fallback")
-            row += 1
-            _sidebar_text(sidebar, row, "sx:{:.2f} sy:{:.2f}".format(
-                alignment["scale_x"], alignment["scale_y"]))
-            row += 1
-            _sidebar_text(sidebar, row, "ox:{:+.1f} oy:{:+.1f}".format(
-                alignment["offset_x"], alignment["offset_y"]))
+            _sidebar_text(sidebar, row, "Mode: guided model missing", (0, 0, 255))
         row += 1
         msg = info.get("alignment_message")
         if msg:
@@ -1167,7 +1161,7 @@ def draw_sidebar(sidebar, info):
         row += 1
         _sidebar_text(sidebar, row, "r:reset  c:done  q:quit", (140, 140, 140))
     else:
-        _sidebar_text(sidebar, row, "t:track  c:calibrate", (140, 140, 140))
+        _sidebar_text(sidebar, row, "t:track", (140, 140, 140))
         row += 1
         _sidebar_text(sidebar, row, "space:center  arrows:manual", (140, 140, 140))
         row += 1
@@ -1290,10 +1284,11 @@ def run_ui():
     detector, detector_errors = load_detector()
     alignment, alignment_error = load_alignment()
     guided_model, guided_error = load_guided_model()
-    if guided_model_ready(guided_model):
-        alignment_message = "guided model loaded"
-    else:
-        alignment_message = guided_error or alignment_error or "offset alignment loaded"
+    if not guided_model_ready(guided_model):
+        raise RuntimeError(
+            "guided thermal/RGB alignment model is required; expected {}".format(
+                GUIDED_ALIGNMENT_FILE))
+    alignment_message = "guided model loaded"
 
     state = SharedState()
     thermal_thread = threading.Thread(target=thermal_worker, args=(state,), daemon=True)
@@ -1408,14 +1403,8 @@ def run_ui():
                         rgb_w, rgb_h,
                         thermal["pixels"].shape[1], thermal["pixels"].shape[0],
                     )
-                    using_guided_model = thermal_point is not None
                     if thermal_point is None:
-                        thermal_point = map_rgb_point_to_thermal(
-                            face_center[0], face_center[1],
-                            rgb_w, rgb_h,
-                            thermal["pixels"].shape[1], thermal["pixels"].shape[0],
-                            alignment=alignment,
-                        )
+                        raise RuntimeError("guided thermal/RGB prediction failed")
                     if calibration_mode:
                         calibration_hotspot = find_hottest_thermal_point(
                             thermal["pixels"], around=thermal_point,
@@ -1423,8 +1412,8 @@ def run_ui():
                     proxy = extract_face_proxy(
                         thermal["pixels"], thermal_point,
                         best_detection["rect"], frame.shape,
-                        landmarks=None if using_guided_model else landmarks,
-                        alignment=None if using_guided_model else alignment,
+                        landmarks=None,
+                        alignment=None,
                     )
                     if proxy is not None:
                         thermal_roi = proxy["roi_bounds"]
@@ -1523,9 +1512,8 @@ def run_ui():
             if key in (27, ord("q")):
                 break
             if key == ord("c"):
-                calibration_mode = not calibration_mode
-                auto_track = False if calibration_mode else auto_track
-                alignment_message = "calibration on" if calibration_mode else "calibration off"
+                calibration_mode = False
+                alignment_message = "guided model required; old calibration disabled"
             elif key == ord("t"):
                 auto_track = not auto_track
             elif calibration_mode and key == ord("g"):
