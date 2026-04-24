@@ -115,6 +115,7 @@ DNN_CONFIDENCE_THRESHOLD = 0.6  # reject low-confidence DNN detections
 
 # Alignment and correction heuristics
 ALIGNMENT_FILE = os.path.expanduser("~/Desktop/thermal_rgb_alignment.json")
+GUIDED_ALIGNMENT_FILE = os.path.expanduser("~/Desktop/thermal_rgb_guided_alignment.json")
 THERMAL_SCALE_X = 1.0
 THERMAL_SCALE_Y = 1.0
 THERMAL_OFFSET_X = 0.0
@@ -122,7 +123,10 @@ THERMAL_OFFSET_Y = 0.0
 ALIGNMENT_NUDGE_PX = 1.0
 ALIGNMENT_SCALE_STEP = 0.02
 ALIGNMENT_HOTSPOT_RADIUS = 6
+THERMAL_BORDER_IGNORE_PX = 2
 THERMAL_PERCENTILE = 85
+THERMAL_BLOB_PERCENTILE = 88
+THERMAL_MIN_BLOB_PIXELS = 3
 REFERENCE_DISTANCE_CM = 100.0
 REFERENCE_AMBIENT_C = 21.0
 REFERENCE_HUMIDITY = 50.0
@@ -300,6 +304,65 @@ def save_alignment(alignment, path=ALIGNMENT_FILE):
     payload["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
+
+
+def default_guided_model():
+    return {
+        "version": 1,
+        "samples": [],
+        "coeff_x": None,
+        "coeff_y": None,
+        "rmse_px": None,
+        "mean_error_px": None,
+        "max_error_px": None,
+        "worst_sample": None,
+        "updated_at": None,
+    }
+
+
+def load_guided_model(path=GUIDED_ALIGNMENT_FILE):
+    model = default_guided_model()
+    try:
+        with open(path, "r") as fh:
+            saved = json.load(fh)
+        if isinstance(saved.get("samples"), list):
+            model["samples"] = saved["samples"]
+        for key in ("coeff_x", "coeff_y"):
+            if isinstance(saved.get(key), list):
+                model[key] = [float(v) for v in saved[key]]
+        for key in ("rmse_px", "mean_error_px", "max_error_px"):
+            if saved.get(key) is not None:
+                model[key] = float(saved[key])
+        model["worst_sample"] = saved.get("worst_sample")
+        model["updated_at"] = saved.get("updated_at")
+        return model, None
+    except IOError:
+        return model, "no guided model"
+    except Exception as exc:
+        return model, "guided model load failed: {}".format(exc)
+
+
+def guided_model_ready(model):
+    return model.get("coeff_x") is not None and model.get("coeff_y") is not None
+
+
+def guided_features(rgb_x, rgb_y, distance_cm, rgb_w, rgb_h):
+    x = float(rgb_x) / max(1.0, float(rgb_w))
+    y = float(rgb_y) / max(1.0, float(rgb_h))
+    z = 1.0 / max(1.0, float(distance_cm or REFERENCE_DISTANCE_CM))
+    return np.array([1.0, x, y, z, x * z, y * z, x * y, x * x, y * y], dtype=np.float64)
+
+
+def predict_guided_point(model, rgb_x, rgb_y, distance_cm, rgb_w, rgb_h,
+                         thermal_w, thermal_h):
+    if not guided_model_ready(model):
+        return None
+    features = guided_features(rgb_x, rgb_y, distance_cm, rgb_w, rgb_h)
+    tx = float(np.dot(np.array(model["coeff_x"], dtype=np.float64), features))
+    ty = float(np.dot(np.array(model["coeff_y"], dtype=np.float64), features))
+    tx = int(max(0, min(thermal_w - 1, round(tx))))
+    ty = int(max(0, min(thermal_h - 1, round(ty))))
+    return tx, ty
 
 
 def get_camera():
@@ -719,17 +782,60 @@ def map_rgb_point_to_thermal(x, y, rgb_w, rgb_h, thermal_w, thermal_h,
 
 
 def find_hottest_thermal_point(thermal_pixels, around=None, radius=None):
+    pixels = np.array(thermal_pixels, dtype=np.float32)
+    h, w = pixels.shape[:2]
+    border = THERMAL_BORDER_IGNORE_PX
+    finite = np.isfinite(pixels)
+    if not np.any(finite):
+        return None
+    if not np.all(finite):
+        pixels = pixels.copy()
+        pixels[~finite] = float(np.min(pixels[finite]))
+
+    score = cv2.blur(pixels, (3, 3))
+    search_mask = np.zeros((h, w), dtype=np.uint8)
+
     if around is not None and radius is not None:
         cx, cy = around
-        x0 = max(0, int(cx - radius))
-        x1 = min(thermal_pixels.shape[1], int(cx + radius + 1))
-        y0 = max(0, int(cy - radius))
-        y1 = min(thermal_pixels.shape[0], int(cy + radius + 1))
-        roi = thermal_pixels[y0:y1, x0:x1]
-        if roi.size:
-            ry, rx = np.unravel_index(int(np.argmax(roi)), roi.shape)
-            return int(x0 + rx), int(y0 + ry)
-    y, x = np.unravel_index(int(np.argmax(thermal_pixels)), thermal_pixels.shape)
+        x0 = max(border, int(cx - radius))
+        x1 = min(w - border, int(cx + radius + 1))
+        y0 = max(border, int(cy - radius))
+        y1 = min(h - border, int(cy + radius + 1))
+        if x1 > x0 and y1 > y0:
+            search_mask[y0:y1, x0:x1] = 1
+    else:
+        search_mask[border:h - border, border:w - border] = 1
+
+    valid_values = score[search_mask.astype(bool)]
+    if valid_values.size == 0:
+        return None
+
+    threshold = float(np.percentile(valid_values, THERMAL_BLOB_PERCENTILE))
+    hot_mask = ((score >= threshold) & search_mask.astype(bool)).astype(np.uint8)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(hot_mask, 8)
+
+    best_label = None
+    best_rank = None
+    min_area = 1 if around is not None else THERMAL_MIN_BLOB_PIXELS
+    for label in range(1, component_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        component = labels == label
+        component_scores = score[component]
+        rank = (float(np.mean(component_scores)), float(np.max(component_scores)), area)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_label = label
+
+    if best_label is not None:
+        component = labels == best_label
+        masked_score = np.where(component, score, -np.inf)
+        y, x = np.unravel_index(int(np.argmax(masked_score)), masked_score.shape)
+        return int(x), int(y)
+
+    masked_score = np.where(search_mask.astype(bool), score, -np.inf)
+    y, x = np.unravel_index(int(np.argmax(masked_score)), masked_score.shape)
     return int(x), int(y)
 
 
@@ -859,7 +965,13 @@ def draw_crosshair(frame, center, color=(255, 255, 255)):
 
 def add_thermal_inset(frame, thermal, thermal_point=None, thermal_roi=None,
                       hotspot_point=None):
-    pixels = thermal["pixels"]
+    pixels = np.array(thermal["pixels"], dtype=np.float32)
+    finite = np.isfinite(pixels)
+    if not np.any(finite):
+        return
+    if not np.all(finite):
+        pixels = pixels.copy()
+        pixels[~finite] = float(np.min(pixels[finite]))
     norm = cv2.normalize(pixels, None, 0, 255, cv2.NORM_MINMAX)
     heat = cv2.applyColorMap(norm.astype(np.uint8), cv2.COLORMAP_INFERNO)
     if thermal_point is not None:
@@ -1026,11 +1138,20 @@ def draw_sidebar(sidebar, info):
     if alignment is not None:
         _sidebar_heading(sidebar, row, "ALIGNMENT")
         row += 1
-        _sidebar_text(sidebar, row, "sx:{:.2f} sy:{:.2f}".format(
-            alignment["scale_x"], alignment["scale_y"]))
-        row += 1
-        _sidebar_text(sidebar, row, "ox:{:+.1f} oy:{:+.1f}".format(
-            alignment["offset_x"], alignment["offset_y"]))
+        guided = info.get("guided_model")
+        if guided_model_ready(guided or {}):
+            _sidebar_text(sidebar, row, "Mode: guided RGB+distance")
+            row += 1
+            _sidebar_text(sidebar, row, "RMSE: {:.2f}px  n:{}".format(
+                guided.get("rmse_px", 0.0), len(guided.get("samples", []))))
+        else:
+            _sidebar_text(sidebar, row, "Mode: offset fallback")
+            row += 1
+            _sidebar_text(sidebar, row, "sx:{:.2f} sy:{:.2f}".format(
+                alignment["scale_x"], alignment["scale_y"]))
+            row += 1
+            _sidebar_text(sidebar, row, "ox:{:+.1f} oy:{:+.1f}".format(
+                alignment["offset_x"], alignment["offset_y"]))
         row += 1
         msg = info.get("alignment_message")
         if msg:
@@ -1075,6 +1196,7 @@ def choose_tracking_step(error_px, deadband_px):
 def run_once():
     detector, detector_errors = load_detector()
     alignment, alignment_error = load_alignment()
+    guided_model, guided_error = load_guided_model()
 
     result = {
         "detector": detector["backend"],
@@ -1085,6 +1207,8 @@ def run_once():
         "ambient": None,
         "alignment": alignment,
         "alignment_status": alignment_error or "loaded",
+        "guided_alignment_status": guided_error or "loaded",
+        "guided_alignment_ready": guided_model_ready(guided_model),
     }
 
     cap = get_camera()
@@ -1165,7 +1289,11 @@ def run_once():
 def run_ui():
     detector, detector_errors = load_detector()
     alignment, alignment_error = load_alignment()
-    alignment_message = alignment_error or "alignment loaded"
+    guided_model, guided_error = load_guided_model()
+    if guided_model_ready(guided_model):
+        alignment_message = "guided model loaded"
+    else:
+        alignment_message = guided_error or alignment_error or "offset alignment loaded"
 
     state = SharedState()
     thermal_thread = threading.Thread(target=thermal_worker, args=(state,), daemon=True)
@@ -1273,20 +1401,30 @@ def run_ui():
                 calibration_rgb_point = face_center
 
                 if thermal is not None:
-                    thermal_point = map_rgb_point_to_thermal(
+                    thermal_point = predict_guided_point(
+                        guided_model,
                         face_center[0], face_center[1],
+                        distance_cm,
                         rgb_w, rgb_h,
                         thermal["pixels"].shape[1], thermal["pixels"].shape[0],
-                        alignment=alignment,
                     )
-                    calibration_hotspot = find_hottest_thermal_point(
-                        thermal["pixels"], around=thermal_point,
-                        radius=ALIGNMENT_HOTSPOT_RADIUS)
+                    using_guided_model = thermal_point is not None
+                    if thermal_point is None:
+                        thermal_point = map_rgb_point_to_thermal(
+                            face_center[0], face_center[1],
+                            rgb_w, rgb_h,
+                            thermal["pixels"].shape[1], thermal["pixels"].shape[0],
+                            alignment=alignment,
+                        )
+                    if calibration_mode:
+                        calibration_hotspot = find_hottest_thermal_point(
+                            thermal["pixels"], around=thermal_point,
+                            radius=ALIGNMENT_HOTSPOT_RADIUS)
                     proxy = extract_face_proxy(
                         thermal["pixels"], thermal_point,
                         best_detection["rect"], frame.shape,
-                        landmarks=landmarks,
-                        alignment=alignment,
+                        landmarks=None if using_guided_model else landmarks,
+                        alignment=None if using_guided_model else alignment,
                     )
                     if proxy is not None:
                         thermal_roi = proxy["roi_bounds"]
@@ -1373,6 +1511,7 @@ def run_ui():
                 "display_fps": fps_display,
                 "detect_fps": detect_fps,
                 "alignment": alignment,
+                "guided_model": guided_model,
                 "alignment_message": alignment_message,
                 "calibration_mode": calibration_mode,
             })

@@ -2347,3 +2347,117 @@ Interpretation:
 - this still needs live validation by moving around the image and checking that
   the model prediction remains aligned with the measured thermal face/forehead
   blob
+
+### Branching and main-app integration of guided model
+
+Time: `2026-04-24 15:42:26 BST`
+
+The standalone no-servo calibration work was preserved separately before
+changing the main application.
+
+Git branch created for the calibration test program:
+
+- branch: `codex/thermal-rgb-calibrator-test`
+- commit: `651957c Add standalone thermal RGB calibration test`
+- pushed to GitHub remote: `origin/codex/thermal-rgb-calibrator-test`
+
+Scope of the calibrator branch:
+
+- `thermal_rgb_alignment_calibrator.py`
+- `thermal_rgb_guided_alignment.json`
+- `thermal_rgb_alignment_saved.json`
+- `jetson-nano-work-log.md`
+
+Reason for keeping this branch separate:
+
+- the calibrator is an experimental/training tool, not the main deployed app
+- it disables servo movement so the camera rig is not nudged during calibration
+- it guided the user through multiple positions and distances to collect a
+  dataset for RGB-to-thermal alignment
+- it contains the development history of the alignment process, including the
+  approaches that failed or were replaced
+
+Development history recorded for the alignment method:
+
+- first approach: fixed offset/scale alignment
+  - result: rejected because alignment changed with distance
+- second approach: distance-aware offset samples
+  - result: still not enough because face position in the RGB image also affects
+    the thermal/RGB mapping
+- third approach: guided 2D position plus distance calibration
+  - user moved to a 3x3 grid at each distance and pressed `a` to capture samples
+  - model fitted thermal `x/y` from RGB face centre and measured distance
+- `140 cm` issue:
+  - initial guided plan included `50`, `80`, `110`, and `140 cm`
+  - user reported that the fit looked good until the `140 cm` samples were
+    included
+  - `140 cm` was removed from the active calibration plan
+  - current model uses `50`, `80`, and `110 cm`
+- thermal hot-corner issue:
+  - MLX90640 sometimes reported the top-right corner as hottest even when it was
+    not physically hot
+  - calibrator was changed to ignore the 2-pixel border and use robust warm-blob
+    selection instead of a single hottest pixel
+- bad design corrected:
+  - early calibrator versions limited thermal search around an untrained
+    estimate
+  - this was removed because calibration must not depend on the model before the
+    model exists
+  - capture now measures the robust thermal blob directly, then the model is
+    fitted afterwards
+
+Main-app integration plan:
+
+- create a separate integration branch for the main application
+- add guided-model loading to `thermal_depth_alignment_app.py`
+- read the saved model from `~/Desktop/thermal_rgb_guided_alignment.json`
+- use the guided regression prediction for the thermal face/forehead point when
+  coefficients are available
+- keep the older offset/scale alignment as a fallback if no guided model exists
+- keep the old manual calibration controls available, but make normal operation
+  prefer the trained guided model
+
+Implementation completed in the main app:
+
+- added `GUIDED_ALIGNMENT_FILE`
+- added guided model load/readiness helpers
+- added the same RGB-position-plus-distance feature vector used by the
+  standalone calibrator
+- added guided thermal point prediction from saved `coeff_x`/`coeff_y`
+- changed main thermal point selection to prefer the guided model and fall back
+  to the old offset/scale mapper only if the model is missing
+- when guided mode is active, the thermal ROI is centred on the predicted
+  thermal forehead/face point rather than remapping landmarks with the old
+  offset model
+- added robust thermal blob selection and finite-value handling to the main app
+  so calibration/debug hotspot overlays are less vulnerable to stuck pixels
+- updated the sidebar to report `Mode: guided RGB+distance` and show the saved
+  fit RMSE/sample count when the guided model is active
+
+Verification so far:
+
+- local Python syntax check passed for:
+  - `thermal_depth_alignment_app.py`
+  - `thermal_rgb_alignment_calibrator.py`
+
+Deployment update:
+
+- time: `2026-04-24 15:43:36 BST`
+- copied updated `thermal_depth_alignment_app.py` to the Jetson Desktop
+- copied the saved guided model JSON to the Jetson Desktop
+- stopped the standalone no-servo calibrator so the RGB camera was free
+- remote syntax check passed on the Jetson
+- launched the main app on the Jetson display with:
+  - `DISPLAY=:0 python3 thermal_depth_alignment_app.py`
+- running process observed:
+  - `python3 thermal_depth_alignment_app.py`
+
+Expected live behaviour in the main app:
+
+- sidebar should report `Mode: guided RGB+distance` if the saved model loaded
+- white point/ROI in the thermal inset should come from the trained guided
+  model, not from the old fixed offset model
+- old offset/scale alignment remains as fallback only if the guided model is
+  absent or invalid
+- standalone calibration program remains separate and is not required for normal
+  main-app operation after the model has been saved
