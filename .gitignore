@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Report binaries are stored in OneDrive, not versioned with the code.
+*.pdf
+*.docx

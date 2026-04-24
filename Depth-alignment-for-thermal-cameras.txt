@@ -1,0 +1,45 @@
+Suggestion details
+Title
+Depth alignment for thermal cameras
+Description
+Thermal cameras are a useful device for monitoring within a smart home environment. They provide information that could be used for monitoring the wellbeing of an individual without intruding on their privacy as well as detecting fire risks.
+
+When monitoring the health of an individual, the distance from the camera makes a significant difference to the temperature readings, so to be useful it is also important to know how far away the person is. This project will seek to develop an approach to adding depth information to the thermal images obtained in order to better estimate the body temperature of an individual.
+
+Indicative Tasks [1]
+Aligning colour camera images to the thermal camera images. Face detection in the colour images with location used to obtain temperature from thermal camera. Integration of distance sensor (or other techniques) for estimating the distance to the person. Integration of pan-tilt servos for tracking a person as they move, or to focus on a hot spot for additional information.
+
+Possible number of projects [2]
+We could run a couple of variations of this suggestion
+Prerequisite Knowledge [3]
+Nothing specified
+Experience [4]
+Some hardware experience is desirable as well as some familiarity programming microcontrollers. Experience of image processing would also be beneficial.
+
+Suitable for a Minor Project [5]
+Yes, this could be suitable for a Minor Project.
+
+Would likely limit to Time of Flight sensor.
+
+Suggested by
+Patricia Shaw
+Hardware or Software [6]
+Some hardware will be provided in the form of an Jetson nano, an rPi camera, a thermal camera, a pan-tilt servo kit and a 10m ultrasonic sensor. However, the hardware would need to remain on campus. The Jetson nano would be running Ubuntu (~18.04) so experience using ubuntu would be beneficial. Different sensors are likely to use additional libraries.
+
+This project is on your shortlist. You can  this suggestion from your shortlist
+
+For more information about shortlists, see the Project Shortlist  section in the Allocation Process information.
+
+Back to list of suggestions from Patricia Shaw
+Notes
+[1] Indicative Tasks - this is a description of likely work that would be expected for the topic. This is indicative and is likely to represent the work, but it does not prevent some variations if they are agreed with the supervisor.
+
+[2] Possible number of projects - this indicates whether the topic may be run in different ways. For some topics, we will only run the project topic for one student. For other suggestions, it may be possible to take the topic and have one than one project that has a different focus. Whether we do allocate more than one instance also depends on how many projects a supervisor can run this year - there will be a limit for each supervisor based on their other workload in the department.
+
+[3] Prerequisite - if there is something listed, it means that you must meet that requirement in order to be considered for the project. The description might require that you have taken a specific module or set of modules. There might be scope for you to be considered if you can demonstrate comparable experience.
+
+[4] Experience - if there is something listed, it would be useful if you had such experience, but it is not essential.
+
+[5] Suitable for a Minor Project - is used to indicate if there is scope to run this topic as a 20-credit Minor Project. That will be possible for some suggestions, but not all. Some projects may need the time available in a 40-credit project to complete the work and therefore not be suitable for students taking the 20-credits module.
+
+[6] Hardware or Software - may be listed for some projects. If there is a description, it indicates that there are some specifc requirements, such as the need to use particular hardware or specific software. Sometimes it will be a requirement. Other times it will be an indication of what is desirable for the project.
