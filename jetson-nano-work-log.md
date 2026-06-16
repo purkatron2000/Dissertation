@@ -1611,3 +1611,131 @@ The Nano was given internet access through the Mac for package installation:
 - Mac IP forwarding was already enabled (`net.inet.ip.forwarding=1`)
 - Mac NAT/PF was already configured
 - Confirmed working: ping to `8.8.8.8` and `google.com` both succeed from the Nano
+
+## GitHub Versioning and Thermal-RGB Alignment Work — April 24, 2026
+
+The local dissertation folder was not previously a Git repository. Before
+continuing the thermal/RGB alignment implementation, the folder was initialised
+as a Git repository and connected to:
+
+- `https://github.com/purkatron2000/Dissertation.git`
+
+Initial baseline pushed to `main`:
+
+- commit `e64c089`
+- message: `Initial Jetson prototype baseline`
+- included files:
+  - `.gitignore`
+  - `Depth-alignment-for-thermal-cameras.txt`
+  - `jetson-nano-work-log.md`
+  - `thermal_depth_alignment_app.py`
+
+The baseline was intentionally created from the pre-alignment version of
+`thermal_depth_alignment_app.py` so the thermal/RGB alignment work can be
+reviewed separately.
+
+Feature branch created:
+
+- `codex/thermal-rgb-alignment`
+
+Thermal/RGB alignment implementation started on the feature branch:
+
+- added persistent alignment settings stored at:
+  - `~/Desktop/thermal_rgb_alignment.json`
+- added alignment parameters:
+  - `scale_x`
+  - `scale_y`
+  - `offset_x`
+  - `offset_y`
+- changed `map_rgb_point_to_thermal()` so RGB-to-thermal mapping uses the
+  loaded alignment settings instead of only fixed constants
+- threaded the active alignment through forehead/face thermal ROI extraction
+- added a calibration sidebar section showing current scale and offset values
+- added live calibration mode toggled with `c`
+- added keyboard controls in calibration mode:
+  - `i` / `k` nudge thermal mapping up/down
+  - `j` / `l` nudge thermal mapping left/right
+  - `x` / `X` decrease/increase horizontal scale
+  - `y` / `Y` decrease/increase vertical scale
+  - `g` snap the mapping offset toward the hottest nearby thermal pixel
+  - `s` save the current alignment JSON
+  - `r` reset alignment to defaults
+- added a thermal inset marker for the local hottest thermal point while in
+  calibration mode
+
+Local verification completed:
+
+- `python3 -m py_compile thermal_depth_alignment_app.py` passes
+
+Jetson deployment status:
+
+- deployment and live calibration testing were not completed at this point
+- the direct Ethernet link to the Nano was not up:
+  - `en8` existed on the Mac
+  - `en8` reported `media: autoselect (none)`
+  - `ping -c 2 192.168.1.10` returned 100% packet loss
+- the user may need to reconnect the Ethernet adapter/cable and rerun the
+  Mac-side static networking commands before SSH/SCP deployment can continue
+
+### Jetson deployment follow-up
+
+The user restored the direct Ethernet link and confirmed ping to the Nano.
+Password-based SSH was then used because the Mac SSH key passphrase was not
+available to the automation process.
+
+Deployment completed:
+
+- backed up the previous Nano desktop app to:
+  - `~/Desktop/thermal_depth_alignment_versions/thermal_depth_alignment_app_pre_alignment_20260319_165442.py`
+- copied the feature-branch `thermal_depth_alignment_app.py` to:
+  - `~/Desktop/thermal_depth_alignment_app.py`
+- remote syntax check passed:
+  - `python3 -m py_compile thermal_depth_alignment_app.py`
+
+`--test-once` result with the deployed alignment app:
+
+- `alignment`: default values loaded
+  - `scale_x=1.0`
+  - `scale_y=1.0`
+  - `offset_x=0.0`
+  - `offset_y=0.0`
+- `alignment_status`: `no saved alignment`
+- `camera`: `True`
+- `detector`: `dnn_ssd`
+- `detector_errors`: `ok`
+- `detections`: `0`
+- `distance_cm`: `296`
+- `ambient`: BME280 working
+  - approximately `20.12 C`
+  - approximately `33.48% RH`
+  - approximately `1017.21 hPa`
+- `servo`:
+  - `pan_ready=True`
+  - `tilt_ready=True`
+- `thermal`: failed
+  - `thermal_error: No I2C device at address: 0x33`
+
+I2C verification:
+
+- `i2cdetect -y 1` did not show `0x33`
+- direct read from URM13 address `0x12` succeeded
+- BME280 chip ID read from `0x76` returned `0x60`
+- direct read from MLX90640 address `0x33` failed
+
+Regression check:
+
+- the backed-up pre-alignment app was run with `--test-once`
+- it produced the same MLX90640 failure:
+  - `thermal_error: No I2C device at address: 0x33`
+- this confirms the current thermal failure is not caused by the new alignment
+  code
+
+Current blocker:
+
+- live thermal/RGB calibration cannot be completed until the MLX90640 is visible
+  again on I2C bus 1 at address `0x33`
+- likely next physical checks:
+  - verify MLX90640 power and ground
+  - verify SDA/SCL wiring to the shared I2C bus
+  - check whether the thermal module has become unplugged or loose
+  - power-cycle the rig if wiring appears correct
